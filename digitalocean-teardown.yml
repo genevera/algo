@@ -1,0 +1,109 @@
+---
+- name: DigitalOcean Teardown
+  hosts: localhost
+  become: false
+
+  tasks:
+    - name: Look for existing deployments in configs directory
+      find:
+        paths: configs
+        file_type: directory
+        recurse: false
+      register: config_dirs
+
+    - name: Load config from most recent deployment
+      block:
+        - set_fact:
+            latest_config_dir: "{{ config_dirs.files | sort(attribute='mtime', reverse=true) | first }}"
+
+        - set_fact:
+            deployment_ip: "{{ latest_config_dir.path | basename }}"
+
+        - include_vars:
+            file: "{{ latest_config_dir.path }}/.config.yml"
+            name: deployment_config
+
+        - debug:
+            msg: "Found deployment at {{ deployment_ip }} ({{ deployment_config.algo_server_name | default('unknown') }})"
+
+      when: config_dirs.files | length > 0
+
+    - name: Fall back to config.cfg if no deployment found
+      include_vars:
+        file: config.cfg
+      when: config_dirs.files | length == 0
+
+    - set_fact:
+        droplet_name: "{{ deployment_config.algo_server_name | default(algo_server_name | default('')) }}"
+        do_token: "{{ deployment_config.algo_do_token | default(algo_do_token | default('')) }}"
+
+    - name: Validate DigitalOcean token
+      assert:
+        that:
+          - do_token != ''
+        msg: "DigitalOcean token is required. Set algo_do_token in config.cfg or deploy first"
+
+    - name: Validate server name
+      assert:
+        that:
+          - droplet_name != ''
+        msg: "Server name is required. Set algo_server_name in config.cfg or deploy first"
+
+    - name: Get droplet info
+      community.digitalocean.digital_ocean_droplet_info:
+        oauth_token: "{{ do_token }}"
+        name: "{{ droplet_name }}"
+      register: droplet_info
+      ignore_errors: true
+
+    - set_fact:
+        droplet_found: "{{ (droplet_info.data.droplets | length > 0) if droplet_info.data is defined else false }}"
+        droplet_id: "{{ (droplet_info.data.droplets | first).id if (droplet_info.data is defined and droplet_info.data.droplets | length > 0) else '' }}"
+
+    - name: Delete the droplet (if found)
+      digital_ocean_droplet:
+        state: absent
+        oauth_token: "{{ do_token }}"
+        name: "{{ droplet_name }}"
+        unique_name: true
+      when: droplet_found
+      ignore_errors: true
+
+    - name: Get all floating IPs
+      community.digitalocean.digital_ocean_floating_ip:
+        state: present
+        oauth_token: "{{ do_token }}"
+      register: floating_ips_all
+      ignore_errors: true
+
+    - name: Extract and delete floating IPs attached to this droplet
+      block:
+        - set_fact:
+            attached_floating_ips: "{{ floating_ips_all.data.floating_ips | selectattr('droplet', 'defined') | selectattr('droplet.id', '==', droplet_id) | list }}"
+
+        - name: Delete floating IPs
+          community.digitalocean.digital_ocean_floating_ip:
+            state: absent
+            oauth_token: "{{ do_token }}"
+            ip: "{{ item.ip }}"
+          loop: "{{ attached_floating_ips }}"
+          when: attached_floating_ips | length > 0
+          ignore_errors: true
+
+      when: droplet_found and floating_ips_all.data is defined
+
+    - name: Delete SSH key used for this deployment
+      digital_ocean_sshkey:
+        state: absent
+        oauth_token: "{{ do_token }}"
+        name: "{{ SSH_keys.comment }}"
+      ignore_errors: true
+
+    - name: Display teardown results
+      debug:
+        msg:
+          - "{{ '✓ Droplet deleted' if droplet_found else '⚠ Droplet not found (may already be deleted)' }}"
+          - "{{ '✓ Floating IP(s) released' if (attached_floating_ips | default([]) | length > 0) else '⚠ No floating IPs found' }}"
+          - "✓ SSH key removal attempted"
+          - ""
+          - "Teardown complete"
